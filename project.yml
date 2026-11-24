@@ -1,0 +1,31 @@
+name: Roost
+options:
+  bundleIdPrefix: dev.roost
+  deploymentTarget:
+    macOS: "26.0"
+packages:
+  RoostCore:
+    path: Packages/RoostCore
+targets:
+  Roost:
+    type: application
+    platform: macOS
+    sources: [App]
+    dependencies:
+      - package: RoostCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.roost.Roost
+        PRODUCT_NAME: Roost
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Roost
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "6.0"
+        ARCHS: arm64
+        # Roost runs git, ssh and Homebrew tools, which the App Sandbox forbids; it ships outside the App Store.
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
