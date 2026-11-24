@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.png" width="128" alt="Roost icon: a house with a terminal prompt"></p>
+
 # Roost
 
 A native Mac app that sets up a developer Mac: GitHub accounts with their own SSH keys, project folders, repos cloned with the right account, and task worktrees. No secrets ever leave your Mac or go into Roost's data.
@@ -22,6 +24,15 @@ Or, if the warning says Apple **"could not verify"** Roost (not that it's **"dam
 2. Go to **System Settings → Privacy & Security**, scroll to "Roost was blocked…", click **Open Anyway** and confirm.
 
 After that it opens normally. To check the download matches the release, compare `shasum -a 256 Roost-macOS-arm64.zip` with the `.sha256` file attached to the release.
+
+### Why this step is needed
+
+- **macOS checks every app you download.** Your browser tags downloads as "from the internet" (an attribute called `com.apple.quarantine`). Before such an app's first launch, macOS's Gatekeeper looks for two things: a signature from a developer Apple has identified (a Developer ID), and Apple's notarization, an automated scan for malware.
+- **Roost doesn't have either yet.** Both come with the paid Apple Developer Program, which this project hasn't joined. So macOS can't vouch for Roost and blocks it. Depending on the macOS version, the warning says it "could not verify" the app or that it's "damaged". The app isn't actually damaged.
+- **The command clears that one tag on Roost.** `xattr -dr com.apple.quarantine /Applications/Roost.app` removes the "from the internet" tag from Roost only. Gatekeeper stays on for every other app.
+- **Only do this for apps you trust.** Here you can check: the checksum shows your download matches the release, and the full source is in this repository. If you'd rather not, build it yourself (see [Build and run](#build-and-run)). An app you build locally isn't tagged, so it opens without the step.
+
+Once Roost is signed with a Developer ID and notarized, this step goes away.
 
 ## What it does
 
