@@ -4,6 +4,19 @@ A native Mac app that sets up a developer Mac: GitHub accounts with their own SS
 
 Requires macOS 26 or later on Apple silicon.
 
+## Download
+
+**[Download Roost for Mac (Apple silicon)](https://github.com/sjlouji/roost/releases/latest/download/Roost-macOS-arm64.zip)** · [All releases](https://github.com/sjlouji/roost/releases)
+
+Unzip it and move **Roost.app** to Applications.
+
+**Opening it the first time.** This build isn't notarized by Apple yet, so macOS blocks it on first launch:
+
+1. Open Roost. When macOS says it can't verify the app, click **Done**.
+2. Go to **System Settings → Privacy & Security**, scroll to "Roost was blocked…", click **Open Anyway** and confirm.
+
+After that it opens normally. To check the download matches the release, compare `shasum -a 256 Roost-macOS-arm64.zip` with the `.sha256` file attached to the release.
+
 ## What it does today
 
 **GitHub accounts**
