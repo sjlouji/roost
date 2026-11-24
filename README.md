@@ -10,9 +10,15 @@ Requires macOS 26 or later on Apple silicon.
 
 Unzip it and move **Roost.app** to Applications.
 
-**Opening it the first time.** This build isn't notarized by Apple yet, so macOS blocks it on first launch:
+**Opening it the first time.** This build isn't notarized by Apple yet, so macOS blocks it on first launch. Don't click **Move to Bin**: the app isn't broken. The quickest fix works for every version of the warning. Run this once in Terminal:
 
-1. Open Roost. When macOS says it can't verify the app, click **Done**.
+```bash
+xattr -dr com.apple.quarantine /Applications/Roost.app
+```
+
+Or, if the warning says Apple **"could not verify"** Roost (not that it's **"damaged"**):
+
+1. Click **Done**.
 2. Go to **System Settings → Privacy & Security**, scroll to "Roost was blocked…", click **Open Anyway** and confirm.
 
 After that it opens normally. To check the download matches the release, compare `shasum -a 256 Roost-macOS-arm64.zip` with the `.sha256` file attached to the release.
