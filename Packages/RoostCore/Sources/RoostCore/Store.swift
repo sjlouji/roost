@@ -1,11 +1,11 @@
 import Foundation
 
-/// Roost's own list of accounts and projects, as JSON in Application Support. Holds no secrets.
+/// Roost's own saved projects, as JSON in Application Support. Holds no secrets.
 public struct Store: Sendable {
     public let url: URL
 
     public static var defaultURL: URL {
-        URL.applicationSupportDirectory.appendingPathComponent("Roost/roost.json")
+        URL.applicationSupportDirectory.appendingPathComponent("Roost/state.json")
     }
 
     public init(url: URL = Store.defaultURL) {

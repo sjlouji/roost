@@ -1,3 +1,4 @@
+import RoostCore
 import SwiftUI
 
 struct RootView: View {
@@ -13,24 +14,35 @@ struct RootView: View {
         @Bindable var model = model
         NavigationSplitView {
             List(selection: $model.selection) {
+                Section("This Mac") {
+                    Label("AWS", systemImage: "cloud").tag(SidebarItem.aws)
+                    Label("Claude Code", systemImage: "sparkles").tag(SidebarItem.claude)
+                }
                 Section("GitHub accounts") {
-                    ForEach(model.state.accounts) { account in
-                        Label(account.label, systemImage: "person.crop.circle").tag(SidebarItem.account(account.id))
+                    ForEach(model.accounts) { account in
+                        Label(account.label, systemImage: "person.crop.circle").tag(SidebarItem.account(account.hostAlias))
                     }
                 }
                 Section("Projects") {
-                    ForEach(model.state.projects) { project in
+                    ForEach(model.projects) { project in
                         Label(project.name, systemImage: "folder").tag(SidebarItem.project(project.id))
                     }
                 }
             }
-            .navigationSplitViewColumnWidth(min: 200, ideal: 230)
+            .navigationSplitViewColumnWidth(min: 210, ideal: 240)
             .toolbar {
+                ToolbarItem {
+                    Button {
+                        model.refresh()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(model.isRefreshing)
+                    .help("Read this Mac's setup again")
+                }
                 ToolbarItem {
                     Menu {
                         Button("New GitHub account…") { sheet = .addAccount }
-                        Button("Import accounts from ~/.ssh/config") { model.importAccounts() }
-                        Divider()
                         Button("New project…") { sheet = .addProject }
                     } label: {
                         Label("Add", systemImage: "plus")
@@ -63,15 +75,19 @@ struct RootView: View {
 
     @ViewBuilder private var detail: some View {
         switch model.selection {
-        case .account(let id):
-            if let account = model.account(id) { AccountDetail(account: account) }
+        case .aws:
+            AWSPage()
+        case .claude:
+            ClaudePage()
+        case .account(let alias):
+            if let account = model.account(alias) { AccountDetail(account: account) }
         case .project(let id):
             if let project = model.project(id) { ProjectDetail(project: project) }
         case nil:
             ContentUnavailableView(
                 "Welcome to Roost",
                 systemImage: "bird",
-                description: Text("Add a GitHub account or a project with the + button, or import the accounts already in ~/.ssh/config.")
+                description: Text("Roost shows what's already set up on this Mac: GitHub accounts from ~/.ssh/config, projects in \(model.projectsRoot), AWS profiles and Claude Code. Pick one on the left, or add something with +.")
             )
         }
     }

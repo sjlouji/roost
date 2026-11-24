@@ -23,7 +23,7 @@ struct ProjectDetail: View {
                 LabeledContent("Path") { Text(project.path).textSelection(.enabled) }
                 Button("Show in Finder") { model.reveal(Paths.url(project.path)) }
             }
-            Section {
+            Section("Repositories") {
                 if project.repos.isEmpty {
                     Text("No repositories yet.").foregroundStyle(.secondary)
                 }
@@ -31,11 +31,6 @@ struct ProjectDetail: View {
                     RepoRow(project: project, repo: repo)
                 }
                 Button("Add repository…") { sheet = .addRepo }
-                    .disabled(model.state.accounts.isEmpty)
-            } header: {
-                Text("Repositories")
-            } footer: {
-                if model.state.accounts.isEmpty { Text("Add a GitHub account first, so Roost knows which key to clone with.") }
             }
             Section {
                 let tasks = Projects.tasks(in: project)
@@ -74,18 +69,23 @@ struct RepoRow: View {
     let project: Project
     let repo: Repo
 
+    private var accountLabel: String {
+        guard let alias = repo.accountAlias else { return "github.com (default key)" }
+        return model.account(alias)?.label ?? alias
+    }
+
     var body: some View {
-        let remote = GitRemote(repo.remote)
         let checkout = Projects.checkoutURL(for: project, repoName: repo.name)
+        let isCloned = Projects.isCloned(checkout)
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text(repo.name).font(.headline)
-                Text("\(remote.map { "\($0.owner)/\($0.name)" } ?? repo.remote) · \(model.account(repo.accountID)?.label ?? "account removed")")
+                Text("\(repo.remote.flatMap(GitRemote.init).map { "\($0.owner)/\($0.name)" } ?? "no remote") · \(accountLabel)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if Projects.isCloned(checkout) {
+            if isCloned {
                 Label("Cloned", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 Button("Show") { model.reveal(checkout) }.buttonStyle(.borderless)
             } else {
@@ -94,7 +94,9 @@ struct RepoRow: View {
             }
         }
         .contextMenu {
-            Button("Remove from project") { model.removeRepo(repo, from: project.id) }
+            if !isCloned {
+                Button("Remove from project") { model.removePlannedRepo(repo, from: project) }
+            }
         }
     }
 }
@@ -105,7 +107,7 @@ struct AddProjectSheet: View {
     @State private var name = ""
     @State private var chosenPath: String?
 
-    private var path: String { chosenPath ?? "~/Documents/\(Slug.make(name))" }
+    private var path: String { chosenPath ?? "\(model.projectsRoot)/\(Slug.make(name))" }
 
     var body: some View {
         Form {
@@ -152,24 +154,25 @@ struct AddRepoSheet: View {
     @Environment(\.dismiss) private var dismiss
     let project: Project
     @State private var remote = ""
-    @State private var accountID: UUID?
+    /// nil clones through plain github.com with the default key.
+    @State private var accountAlias: String?
 
     private var parsed: GitRemote? { GitRemote(remote) }
-    private var account: GitAccount? { accountID.flatMap(model.account) }
 
     var body: some View {
         Form {
             Section {
                 TextField("Repository", text: $remote, prompt: Text("git@github.com:owner/repo.git or https://github.com/owner/repo"))
-                Picker("Clone with", selection: $accountID) {
-                    ForEach(model.state.accounts) { account in
-                        Text("\(account.label) (\(account.hostAlias))").tag(Optional(account.id))
+                Picker("Clone with", selection: $accountAlias) {
+                    ForEach(model.accounts) { account in
+                        Text("\(account.label) (\(account.hostAlias))").tag(Optional(account.hostAlias))
                     }
+                    Text("Default key (github.com)").tag(String?.none)
                 }
             }
-            if let parsed, let account {
+            if let parsed {
                 Section("Roost will clone") {
-                    Text(verbatim: parsed.sshURL(alias: account.hostAlias)).font(.body.monospaced())
+                    Text(verbatim: parsed.sshURL(alias: accountAlias ?? "github.com")).font(.body.monospaced())
                     Text("into \(project.path)/default/\(parsed.name)").foregroundStyle(.secondary)
                 }
             } else if !remote.isEmpty {
@@ -178,15 +181,15 @@ struct AddRepoSheet: View {
         }
         .formStyle(.grouped)
         .frame(width: 540)
-        .onAppear { accountID = accountID ?? model.state.accounts.first?.id }
+        .onAppear { accountAlias = accountAlias ?? model.accounts.first?.hostAlias }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {
                 Button("Add") {
-                    if let accountID { model.addRepo(remote: remote, accountID: accountID, to: project.id) }
+                    model.addRepo(remote: remote, accountAlias: accountAlias, to: project)
                     dismiss()
                 }
-                .disabled(parsed == nil || account == nil)
+                .disabled(parsed == nil)
             }
         }
     }
@@ -197,20 +200,20 @@ struct NewTaskSheet: View {
     @Environment(\.dismiss) private var dismiss
     let project: Project
     let repos: [Repo]
-    @State private var repoID: UUID?
+    @State private var repoName: String?
     @State private var task = ""
     @State private var branch = ""
     @State private var createBranch = true
 
-    private var repo: Repo? { repos.first { $0.id == repoID } }
+    private var repo: Repo? { repos.first { $0.name == repoName } }
     private var taskName: String { Slug.make(task) }
     private var branchName: String { branch.isEmpty ? taskName : branch.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
         Form {
             Section {
-                Picker("Repository", selection: $repoID) {
-                    ForEach(repos) { repo in Text(repo.name).tag(Optional(repo.id)) }
+                Picker("Repository", selection: $repoName) {
+                    ForEach(repos) { repo in Text(repo.name).tag(Optional(repo.name)) }
                 }
                 TextField("Task", text: $task, prompt: Text("fs-123-fix-login"))
                 TextField("Branch", text: $branch, prompt: Text(taskName.isEmpty ? "same as the task" : taskName))
@@ -226,7 +229,7 @@ struct NewTaskSheet: View {
         }
         .formStyle(.grouped)
         .frame(width: 500)
-        .onAppear { repoID = repoID ?? repos.first?.id }
+        .onAppear { repoName = repoName ?? repos.first?.name }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {

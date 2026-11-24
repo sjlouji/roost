@@ -3,85 +3,110 @@ import Observation
 import RoostCore
 
 enum SidebarItem: Hashable {
-    case account(UUID)
-    case project(UUID)
+    case aws
+    case claude
+    case account(String)
+    case project(String)
+}
+
+/// Everything Roost found on this Mac in one read, made off the main thread.
+private struct Snapshot: Sendable {
+    let accounts: Result<[GitAccount], any Error>
+    let projects: [Project]
+    let awsProfiles: Result<[AWSProfile], any Error>
+    let claude: Result<ClaudeInventory, any Error>
+
+    static func read(saved: [Project], projectsRoot: URL) -> Snapshot {
+        Snapshot(
+            accounts: Result { try GitAccounts.discover() },
+            projects: Projects.merge(saved: saved, discovered: Projects.discover(under: projectsRoot)),
+            awsProfiles: Result { try AWS.profiles() },
+            claude: Result { try ClaudeSetup.inventory() }
+        )
+    }
 }
 
 @MainActor
 @Observable
 final class AppModel {
-    var state = RoostState()
+    var accounts: [GitAccount] = []
+    var projects: [Project] = []
+    var awsProfiles: [AWSProfile] = []
+    var awsIdentities: [String: AWSIdentity] = [:]
+    var claude: ClaudeInventory?
+    var claudeImportPlan: ClaudeImportPlan?
+    var claudeExportReport: ClaudeExportReport?
+    var claudeImportReport: ClaudeImportReport?
+    var connections: [String: ConnectionStatus] = [:]
     var selection: SidebarItem?
     var log: [String] = []
     var runningTask: String?
     var errorMessage: String?
-    var connections: [UUID: ConnectionStatus] = [:]
-    /// Bumped after anything that changes folders on disk, so views re-read clone and task state.
+    var isRefreshing = false
+    /// Bumped after anything changes folders on disk, so views re-read clone and task state.
     var diskVersion = 0
 
+    let projectsRoot = "~/Documents"
+    private var saved = RoostState()
     private let store = Store()
 
     init() {
         do {
-            state = try store.load()
+            saved = try store.load()
         } catch {
-            report(error, context: "Couldn't read Roost's saved accounts and projects")
+            report(error, context: "Couldn't read Roost's saved projects")
+        }
+        refresh()
+    }
+
+    func account(_ alias: String) -> GitAccount? { accounts.first { $0.hostAlias == alias } }
+    func project(_ id: String) -> Project? { projects.first { $0.id == id } }
+
+    /// Re-reads ~/.ssh/config, the projects folder, AWS profiles and ~/.claude.
+    func refresh() {
+        isRefreshing = true
+        let savedProjects = saved.projects
+        let root = Paths.url(projectsRoot)
+        Task {
+            let snapshot = await Task.detached { Snapshot.read(saved: savedProjects, projectsRoot: root) }.value
+            switch snapshot.accounts {
+            case .success(let found): accounts = found
+            case .failure(let error): report(error, context: "Couldn't read ~/.ssh/config")
+            }
+            projects = snapshot.projects
+            switch snapshot.awsProfiles {
+            case .success(let found): awsProfiles = found
+            case .failure(let error): report(error, context: "Couldn't read your AWS profiles")
+            }
+            switch snapshot.claude {
+            case .success(let found): claude = found
+            case .failure(let error): report(error, context: "Couldn't read your Claude Code setup")
+            }
+            diskVersion += 1
+            isRefreshing = false
         }
     }
 
-    func account(_ id: UUID) -> GitAccount? { state.accounts.first { $0.id == id } }
-    func project(_ id: UUID) -> Project? { state.projects.first { $0.id == id } }
-
-    // MARK: - Accounts
-
-    func importAccounts() {
-        do {
-            let url = SSHConfig.defaultURL
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                log.append("No ~/.ssh/config yet, so there's nothing to import.")
-                return
-            }
-            let found = GitAccounts.importable(from: try String(contentsOf: url, encoding: .utf8), existing: state.accounts)
-            guard !found.isEmpty else {
-                log.append("No new GitHub accounts found in ~/.ssh/config.")
-                return
-            }
-            state.accounts += found
-            try store.save(state)
-            log.append("Imported from ~/.ssh/config: " + found.map(\.hostAlias).joined(separator: ", "))
-            selection = .account(found[0].id)
-        } catch {
-            report(error, context: "Couldn't import accounts from ~/.ssh/config")
-        }
-    }
+    // MARK: - GitHub accounts
 
     func addAccount(label: String, email: String) {
-        let account = GitAccount(
-            label: label,
-            hostAlias: GitAccounts.suggestedAlias(for: label),
-            keyPath: GitAccounts.suggestedKeyPath(for: label),
-            email: email
-        )
+        let account = GitAccount(hostAlias: GitAccounts.suggestedAlias(for: label), keyPath: GitAccounts.suggestedKeyPath(for: label))
         perform("Add GitHub account “\(label)”") {
-            if self.state.accounts.contains(where: { $0.hostAlias == account.hostAlias }) {
-                throw RoostError.hostAliasExists(account.hostAlias)
-            }
             if GitAccounts.hasKey(account) {
                 self.log.append("Using the existing key \(account.keyPath).")
             } else {
-                try await GitAccounts.generateKey(for: account, onLine: self.sink)
+                try await GitAccounts.generateKey(for: account, comment: email, onLine: self.sink)
             }
             try SSHConfig.addHost(alias: account.hostAlias, identityFile: account.keyPath)
             self.log.append("Added Host \(account.hostAlias) to ~/.ssh/config.")
-            self.state.accounts.append(account)
-            try self.store.save(self.state)
-            self.selection = .account(account.id)
+            self.selection = .account(account.hostAlias)
+            self.refresh()
         }
     }
 
     func generateKey(for account: GitAccount) {
         perform("Generate key for “\(account.label)”") {
-            try await GitAccounts.generateKey(for: account, onLine: self.sink)
+            try await GitAccounts.generateKey(for: account, comment: "", onLine: self.sink)
             self.diskVersion += 1
         }
     }
@@ -101,61 +126,60 @@ final class AppModel {
     func testConnection(_ account: GitAccount) {
         perform("Test “\(account.label)” on GitHub") {
             let status = try await GitAccounts.testConnection(account, onLine: self.sink)
-            self.connections[account.id] = status
+            self.connections[account.hostAlias] = status
             if case .failed = status {
                 self.log.append("Not connected yet. Add the public key on GitHub, then test again.")
             }
         }
     }
 
-    func removeAccount(_ account: GitAccount) {
-        state.accounts.removeAll { $0.id == account.id }
-        connections[account.id] = nil
-        selection = nil
-        save(context: "Couldn't save after removing the account")
-        log.append("Removed “\(account.label)” from Roost. Its key file and ~/.ssh/config entry are untouched.")
-    }
-
     // MARK: - Projects
 
     func addProject(name: String, path: String) {
-        let project = Project(name: name, path: path)
         do {
             try FileManager.default.createDirectory(at: Paths.url(path), withIntermediateDirectories: true)
-            state.projects.append(project)
-            try store.save(state)
-            selection = .project(project.id)
+            let project = Project(name: name, path: path)
+            saved.projects.append(project)
+            try store.save(saved)
             log.append("Created project “\(name)” at \(path).")
+            selection = .project(project.id)
+            refresh()
         } catch {
-            report(error, context: "Couldn't create the project folder")
+            report(error, context: "Couldn't create the project")
         }
     }
 
-    func addRepo(remote: String, accountID: UUID, to projectID: UUID) {
-        guard GitRemote(remote) != nil else {
-            report(RoostError.invalidRemote(remote), context: "Couldn't add the repository")
-            return
+    func addRepo(remote: String, accountAlias: String?, to project: Project) {
+        do {
+            let repo = try Projects.repo(forRemote: remote, accountAlias: accountAlias)
+            if let index = saved.projects.firstIndex(where: { $0.id == project.id }) {
+                saved.projects[index].repos.append(repo)
+            } else {
+                saved.projects.append(Project(name: project.name, path: project.path, repos: [repo]))
+            }
+            try store.save(saved)
+            refresh()
+        } catch {
+            report(error, context: "Couldn't add the repository")
         }
-        guard let index = state.projects.firstIndex(where: { $0.id == projectID }) else { return }
-        state.projects[index].repos.append(Repo(remote: remote.trimmingCharacters(in: .whitespaces), accountID: accountID))
-        save(context: "Couldn't save the repository")
     }
 
-    func removeRepo(_ repo: Repo, from projectID: UUID) {
-        guard let index = state.projects.firstIndex(where: { $0.id == projectID }) else { return }
-        state.projects[index].repos.removeAll { $0.id == repo.id }
-        save(context: "Couldn't save after removing the repository")
-        log.append("Removed \(repo.name) from the project list. Files on disk are untouched.")
+    /// Only for repositories Roost is holding before they're cloned; cloned ones live on disk.
+    func removePlannedRepo(_ repo: Repo, from project: Project) {
+        guard let index = saved.projects.firstIndex(where: { $0.id == project.id }) else { return }
+        saved.projects[index].repos.removeAll { $0.name == repo.name }
+        do {
+            try store.save(saved)
+        } catch {
+            report(error, context: "Couldn't save after removing the repository")
+        }
+        refresh()
     }
 
     func clone(_ repo: Repo, in project: Project) {
-        guard let account = account(repo.accountID) else {
-            report(RoostError.accountMissing(repo.name), context: "Couldn't clone")
-            return
-        }
-        perform("Clone \(repo.name) with “\(account.label)”") {
-            try await Projects.clone(repo, in: project, using: account, onLine: self.sink)
-            self.diskVersion += 1
+        perform("Clone \(repo.name)") {
+            try await Projects.clone(repo, in: project, onLine: self.sink)
+            self.refresh()
         }
     }
 
@@ -171,6 +195,113 @@ final class AppModel {
 
     func reveal(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    // MARK: - AWS
+
+    func whoAmI(_ profile: AWSProfile) {
+        perform("Check AWS profile \(profile.name)") {
+            self.awsIdentities[profile.name] = try await AWS.whoAmI(profile.name, onLine: self.sink)
+        }
+    }
+
+    func checkAllAWSProfiles() {
+        let profiles = awsProfiles
+        perform("Check every AWS profile") {
+            for profile in profiles {
+                self.awsIdentities[profile.name] = try await AWS.whoAmI(profile.name, onLine: self.sink)
+            }
+        }
+    }
+
+    func addVaultProfile(name: String, region: String, accessKeyID: String, secretAccessKey: String) {
+        perform("Add AWS profile \(name) (Keychain)") {
+            try await AWS.addVaultProfile(
+                name: name, region: region, accessKeyID: accessKeyID, secretAccessKey: secretAccessKey, onLine: self.sink
+            )
+            self.awsIdentities[name] = try await AWS.whoAmI(name, onLine: self.sink)
+            self.refresh()
+        }
+    }
+
+    func setTemporaryCredentials(name: String, region: String, accessKeyID: String, secretAccessKey: String, sessionToken: String) {
+        perform("Save temporary credentials for \(name)") {
+            try AWS.setTemporaryCredentials(
+                name: name, region: region, accessKeyID: accessKeyID, secretAccessKey: secretAccessKey, sessionToken: sessionToken
+            )
+            self.log.append("Saved temporary credentials for \(name) in ~/.aws/credentials.")
+            self.awsIdentities[name] = try await AWS.whoAmI(name, onLine: self.sink)
+            self.refresh()
+        }
+    }
+
+    func addSSOProfile(name: String, region: String, startURL: String, ssoRegion: String, accountID: String, roleName: String) {
+        do {
+            try AWS.addSSOProfile(
+                name: name, region: region, startURL: startURL, ssoRegion: ssoRegion, accountID: accountID, roleName: roleName
+            )
+            log.append("Added SSO profile \(name). Use Sign in to log in through the browser.")
+            refresh()
+        } catch {
+            report(error, context: "Couldn't add the SSO profile")
+        }
+    }
+
+    func signInSSO(_ profile: AWSProfile) {
+        perform("Sign in to \(profile.name)") {
+            try await AWS.signInSSO(profile.name, onLine: self.sink)
+            self.awsIdentities[profile.name] = try await AWS.whoAmI(profile.name, onLine: self.sink)
+        }
+    }
+
+    func moveToVault(_ profile: AWSProfile, region: String) {
+        perform("Move \(profile.name) into the Keychain") {
+            try await AWS.moveToVault(profile.name, region: region, onLine: self.sink)
+            self.log.append("\(profile.name) now reads its key from the Keychain; the plain-text copy is deleted.")
+            self.awsIdentities[profile.name] = nil
+            self.refresh()
+        }
+    }
+
+    func removeProfile(_ profile: AWSProfile) {
+        perform("Remove AWS profile \(profile.name)") {
+            try await AWS.removeProfile(profile, onLine: self.sink)
+            self.awsIdentities[profile.name] = nil
+            self.refresh()
+        }
+    }
+
+    func installTool(formula: String) {
+        perform("Install \(formula)") {
+            try await AWS.install(formula: formula, onLine: self.sink)
+            self.refresh()
+        }
+    }
+
+    // MARK: - Claude Code
+
+    func exportClaude(to bundle: URL, options: ClaudeExportOptions) {
+        perform("Export Claude Code setup") {
+            let report = try await Task.detached { try ClaudeSetup.export(to: bundle, options: options) }.value
+            self.log.append("Exported \(report.files) file(s) and \(report.memoryFolders) memory folder(s) to \(Paths.abbreviate(bundle.path)).")
+            self.claudeExportReport = report
+            self.reveal(bundle)
+        }
+    }
+
+    func planClaudeImport(from bundle: URL) {
+        perform("Read Claude Code export") {
+            self.claudeImportPlan = try await Task.detached { try ClaudeSetup.plan(from: bundle) }.value
+        }
+    }
+
+    func applyClaudeImport(_ plan: ClaudeImportPlan, secrets: [String: String]) {
+        claudeImportPlan = nil
+        perform("Import Claude Code setup") {
+            let report = try await ClaudeSetup.apply(plan, secrets: secrets, onLine: self.sink)
+            self.claudeImportReport = report
+            self.refresh()
+        }
     }
 
     // MARK: - Running work
@@ -196,14 +327,6 @@ final class AppModel {
                 report(error, context: title)
             }
             runningTask = nil
-        }
-    }
-
-    private func save(context: String) {
-        do {
-            try store.save(state)
-        } catch {
-            report(error, context: context)
         }
     }
 

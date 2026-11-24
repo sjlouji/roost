@@ -20,16 +20,19 @@ public enum GitAccounts {
         FileManager.default.fileExists(atPath: Paths.expand(account.keyPath))
     }
 
-    /// GitHub host aliases already in `~/.ssh/config` that Roost doesn't know yet.
-    public static func importable(from configText: String, existing: [GitAccount]) -> [GitAccount] {
-        let known = Set(existing.map { $0.hostAlias.lowercased() })
-        return SSHConfig.parse(configText).compactMap { host in
+    /// Every GitHub host alias in `~/.ssh/config` that names its own key.
+    public static func discover(from configText: String) -> [GitAccount] {
+        SSHConfig.parse(configText).compactMap { host in
             guard host.hostName?.lowercased() == "github.com",
                   host.alias.lowercased() != "github.com",
-                  !known.contains(host.alias.lowercased()),
                   let identityFile = host.identityFile else { return nil }
-            return GitAccount(label: label(fromAlias: host.alias), hostAlias: host.alias, keyPath: identityFile, email: "")
+            return GitAccount(hostAlias: host.alias, keyPath: identityFile)
         }
+    }
+
+    public static func discover(at url: URL = SSHConfig.defaultURL) throws -> [GitAccount] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        return discover(from: try String(contentsOf: url, encoding: .utf8))
     }
 
     static func label(fromAlias alias: String) -> String {
@@ -39,7 +42,7 @@ public enum GitAccounts {
         return label.isEmpty ? alias : label
     }
 
-    public static func generateKey(for account: GitAccount, onLine: LineSink? = nil) async throws {
+    public static func generateKey(for account: GitAccount, comment: String, onLine: LineSink? = nil) async throws {
         let path = Paths.expand(account.keyPath)
         guard !FileManager.default.fileExists(atPath: path) else { throw RoostError.keyExists(account.keyPath) }
         try FileManager.default.createDirectory(
@@ -47,8 +50,8 @@ public enum GitAccounts {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        let comment = account.email.isEmpty ? account.hostAlias : account.email
-        try await Shell.runChecked("ssh-keygen", ["-t", "ed25519", "-C", comment, "-f", path, "-N", ""], onLine: onLine)
+        let keyComment = comment.isEmpty ? account.hostAlias : comment
+        try await Shell.runChecked("ssh-keygen", ["-t", "ed25519", "-C", keyComment, "-f", path, "-N", ""], onLine: onLine)
     }
 
     public static func publicKey(for account: GitAccount) throws -> String {

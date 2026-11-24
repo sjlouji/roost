@@ -8,11 +8,13 @@ struct AccountDetail: View {
     var body: some View {
         let _ = model.diskVersion
         Form {
-            Section("Account") {
-                LabeledContent("Name", value: account.label)
+            Section {
                 LabeledContent("SSH host alias", value: account.hostAlias)
                 LabeledContent("Key file", value: account.keyPath)
-                if !account.email.isEmpty { LabeledContent("Email", value: account.email) }
+            } header: {
+                Text("Account")
+            } footer: {
+                Text("Read from ~/.ssh/config.")
             }
             Section("Clone addresses for this account") {
                 Text(verbatim: "git@\(account.hostAlias):<owner>/<repo>.git")
@@ -34,18 +36,13 @@ struct AccountDetail: View {
                         .disabled(model.runningTask != nil)
                 }
             }
-            Section {
-                Button("Remove from Roost", role: .destructive) { model.removeAccount(account) }
-            } footer: {
-                Text("Removing keeps the key file and its ~/.ssh/config entry.")
-            }
         }
         .formStyle(.grouped)
         .navigationTitle(account.label)
     }
 
     @ViewBuilder private var connectionStatus: some View {
-        switch model.connections[account.id] {
+        switch model.connections[account.hostAlias] {
         case .authenticated(let user):
             Label("Signed in as \(user)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
         case .failed:

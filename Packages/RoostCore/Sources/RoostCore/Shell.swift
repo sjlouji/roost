@@ -10,11 +10,16 @@ public typealias LineSink = @Sendable (String) async -> Void
 
 /// Runs command-line tools. Every command is echoed to `onLine` as `$ …` before it runs, so the user sees exactly what happens.
 public enum Shell {
-    // A GUI app starts with a minimal PATH; Homebrew tools live outside it.
-    static let searchPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    // A GUI app starts with a minimal PATH; Homebrew tools and the claude CLI live outside it.
+    static var searchPath: String {
+        "\(Paths.home.path)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    }
 
-    public static func describe(_ tool: String, _ arguments: [String]) -> String {
-        ([tool] + arguments).map(quote).joined(separator: " ")
+    /// The command as shown in the log; any `redacting` values (secrets inside arguments) are masked.
+    public static func describe(_ tool: String, _ arguments: [String], redacting secrets: [String] = []) -> String {
+        var line = ([tool] + arguments).map(quote).joined(separator: " ")
+        for secret in secrets where !secret.isEmpty { line = line.replacingOccurrences(of: secret, with: "•••") }
+        return line
     }
 
     static func quote(_ argument: String) -> String {
@@ -29,9 +34,10 @@ public enum Shell {
         _ arguments: [String],
         in directory: URL? = nil,
         environment: [String: String] = [:],
+        redacting secrets: [String] = [],
         onLine: LineSink? = nil
     ) async throws -> CommandResult {
-        await onLine?("$ " + describe(tool, arguments))
+        await onLine?("$ " + describe(tool, arguments, redacting: secrets))
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [tool] + arguments
@@ -44,14 +50,22 @@ public enum Shell {
         process.standardOutput = pipe
         process.standardError = pipe
         process.standardInput = FileHandle.nullDevice
+        // waitUntilExit() spins a run loop, which Swift's async threads don't have, and can hang after the child exits.
+        // The exit status is handed over through a stream set up before launch, so an early exit isn't missed.
+        let (exits, exitContinuation) = AsyncStream.makeStream(of: Int32.self, bufferingPolicy: .bufferingNewest(1))
+        process.terminationHandler = { finished in
+            exitContinuation.yield(finished.terminationStatus)
+            exitContinuation.finish()
+        }
         try process.run()
         var lines: [String] = []
         for try await line in pipe.fileHandleForReading.bytes.lines {
             lines.append(line)
             await onLine?(line)
         }
-        process.waitUntilExit()
-        return CommandResult(status: process.terminationStatus, output: lines.joined(separator: "\n"))
+        var status: Int32 = -1
+        for await exitStatus in exits { status = exitStatus }
+        return CommandResult(status: status, output: lines.joined(separator: "\n"))
     }
 
     /// Like `run`, but a non-zero exit throws `RoostError.commandFailed`.
@@ -61,11 +75,14 @@ public enum Shell {
         _ arguments: [String],
         in directory: URL? = nil,
         environment: [String: String] = [:],
+        redacting secrets: [String] = [],
         onLine: LineSink? = nil
     ) async throws -> CommandResult {
-        let result = try await run(tool, arguments, in: directory, environment: environment, onLine: onLine)
+        let result = try await run(tool, arguments, in: directory, environment: environment, redacting: secrets, onLine: onLine)
         guard result.succeeded else {
-            throw RoostError.commandFailed(command: describe(tool, arguments), status: result.status, output: result.output)
+            throw RoostError.commandFailed(
+                command: describe(tool, arguments, redacting: secrets), status: result.status, output: result.output
+            )
         }
         return result
     }

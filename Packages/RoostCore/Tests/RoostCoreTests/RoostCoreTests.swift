@@ -2,10 +2,22 @@ import Foundation
 import Testing
 @testable import RoostCore
 
-private func makeTempDirectory() throws -> URL {
+func makeTempDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("roost-tests-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+func write(_ text: String, to url: URL) throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try text.write(to: url, atomically: true, encoding: .utf8)
+}
+
+func makeClone(at folder: URL, origin: String?) async throws {
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    try await Shell.runChecked("git", ["init", "-q", "-b", "main"], in: folder)
+    try await Shell.runChecked("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"], in: folder)
+    if let origin { try await Shell.runChecked("git", ["remote", "add", "origin", origin], in: folder) }
 }
 
 @Suite struct GitRemoteTests {
@@ -67,17 +79,16 @@ private func makeTempDirectory() throws -> URL {
         #expect(hosts[2].hostName == "GitHub.com")
     }
 
-    @Test func importsOnlyUnknownGitHubAliases() {
-        let known = [GitAccount(label: "work", hostAlias: "github-work", keyPath: "~/.ssh/id_ed25519_work", email: "")]
-        let imported = GitAccounts.importable(from: Self.sample, existing: known)
-        #expect(imported.map(\.hostAlias) == ["github-personal.com"])
-        #expect(imported.first?.label == "personal")
+    @Test func discoversGitHubAccountsOnly() {
+        let accounts = GitAccounts.discover(from: Self.sample)
+        #expect(accounts.map(\.hostAlias) == ["github-work", "github-personal.com"])
+        #expect(accounts.map(\.label) == ["work", "personal"])
     }
 
     @Test func addsHostWithBackupAndRefusesDuplicates() throws {
         let directory = try makeTempDirectory()
         let config = directory.appendingPathComponent("config")
-        try "Host old\n  HostName example.com".write(to: config, atomically: true, encoding: .utf8)
+        try write("Host old\n  HostName example.com", to: config)
 
         try SSHConfig.addHost(alias: "github-work", identityFile: "~/.ssh/id_ed25519_work", at: config)
 
@@ -113,13 +124,13 @@ private func makeTempDirectory() throws -> URL {
 
     @Test func generatesKeyOnceAndNeverOverwrites() async throws {
         let keyPath = try makeTempDirectory().appendingPathComponent("id_ed25519_test").path
-        let account = GitAccount(label: "test", hostAlias: "github-test", keyPath: keyPath, email: "test@example.com")
+        let account = GitAccount(hostAlias: "github-test", keyPath: keyPath)
 
-        try await GitAccounts.generateKey(for: account)
+        try await GitAccounts.generateKey(for: account, comment: "test@example.com")
 
         #expect(GitAccounts.hasKey(account))
         #expect(try GitAccounts.publicKey(for: account).hasPrefix("ssh-ed25519 "))
-        await #expect(throws: RoostError.keyExists(keyPath)) { try await GitAccounts.generateKey(for: account) }
+        await #expect(throws: RoostError.keyExists(keyPath)) { try await GitAccounts.generateKey(for: account, comment: "") }
     }
 }
 
@@ -132,22 +143,54 @@ private func makeTempDirectory() throws -> URL {
         #expect(await lines.all.first == "$ printf 'one\\ntwo\\n'")
     }
 
+    @Test func masksSecretsInTheEchoedCommand() {
+        #expect(Shell.describe("tool", ["--token", "s3cret-value"], redacting: ["s3cret-value"]) == "tool --token •••")
+    }
+
     @Test func checkedRunThrowsOnFailure() async {
         await #expect(throws: RoostError.self) { try await Shell.runChecked("false", []) }
     }
 }
 
 @Suite struct ProjectsTests {
+    @Test func discoversProjectLayoutAndRepoAccounts() async throws {
+        let root = try makeTempDirectory()
+        let project = root.appendingPathComponent("acme/platform")
+        try await makeClone(at: project.appendingPathComponent("default/api"), origin: "git@github-work:acme/api.git")
+        try await makeClone(at: project.appendingPathComponent("default/web"), origin: "https://github.com/acme/web")
+        try await makeClone(at: root.appendingPathComponent("standalone"), origin: nil)
+        try FileManager.default.createDirectory(at: project.appendingPathComponent("fs-1-fix"), withIntermediateDirectories: true)
+
+        let found = Projects.discover(under: root)
+
+        #expect(found.map(\.name) == ["platform"])
+        #expect(found[0].repos == [
+            Repo(name: "api", remote: "git@github-work:acme/api.git", accountAlias: "github-work"),
+            Repo(name: "web", remote: "https://github.com/acme/web", accountAlias: nil),
+        ])
+        #expect(Projects.tasks(in: found[0]) == ["fs-1-fix"])
+    }
+
+    @Test func mergeKeepsPlannedReposAndSavedOnlyProjects() {
+        let cloned = Repo(name: "api", remote: "git@github-work:acme/api.git", accountAlias: "github-work")
+        let planned = Repo(name: "docs", remote: "git@github.com:acme/docs.git", accountAlias: nil)
+        let discovered = [Project(name: "platform", path: "/tmp/x/platform", repos: [cloned])]
+        let saved = [
+            Project(name: "platform", path: "/tmp/x/platform", repos: [cloned, planned]),
+            Project(name: "empty", path: "/tmp/x/empty"),
+        ]
+
+        let merged = Projects.merge(saved: saved, discovered: discovered)
+
+        #expect(merged.map(\.name) == ["empty", "platform"])
+        #expect(merged[1].repos.map(\.name) == ["api", "docs"])
+    }
+
     @Test func createsTaskWorktreeFromMainClone() async throws {
         let root = try makeTempDirectory()
         let project = Project(name: "Demo", path: root.path)
-        let repo = Repo(remote: "git@github.com:acme/widget.git", accountID: UUID())
-        let main = Projects.checkoutURL(for: project, repoName: "widget")
-        try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-        try await Shell.runChecked("git", ["init", "-q", "-b", "main"], in: main)
-        try await Shell.runChecked(
-            "git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"], in: main
-        )
+        let repo = Repo(name: "widget", remote: "git@github.com:acme/widget.git", accountAlias: nil)
+        try await makeClone(at: Projects.checkoutURL(for: project, repoName: "widget"), origin: nil)
 
         let worktree = try await Projects.addTask(named: "fs-1-fix", repo: repo, in: project, branch: "fs-1-fix", createBranch: true)
 
@@ -158,7 +201,7 @@ private func makeTempDirectory() throws -> URL {
 
     @Test func refusesBadTaskNamesAndUnclonedRepos() async throws {
         let project = Project(name: "Demo", path: try makeTempDirectory().path)
-        let repo = Repo(remote: "git@github.com:acme/widget.git", accountID: UUID())
+        let repo = Repo(name: "widget", remote: "git@github.com:acme/widget.git", accountAlias: nil)
         await #expect(throws: RoostError.invalidName("default")) {
             try await Projects.addTask(named: "default", repo: repo, in: project, branch: "x", createBranch: true)
         }
@@ -173,20 +216,18 @@ private func makeTempDirectory() throws -> URL {
 
 @Suite struct StoreTests {
     @Test func roundTripsAndTreatsMissingFileAsEmpty() throws {
-        let store = Store(url: try makeTempDirectory().appendingPathComponent("Roost/roost.json"))
+        let store = Store(url: try makeTempDirectory().appendingPathComponent("Roost/state.json"))
         #expect(try store.load() == RoostState())
 
-        let account = GitAccount(label: "work", hostAlias: "github-work", keyPath: "~/.ssh/k", email: "")
-        let state = RoostState(
-            accounts: [account],
-            projects: [Project(name: "Demo", path: "~/Documents/demo", repos: [Repo(remote: "git@github.com:a/b.git", accountID: account.id)])]
-        )
+        let state = RoostState(projects: [
+            Project(name: "Demo", path: "~/Documents/demo", repos: [Repo(name: "b", remote: "git@github.com:a/b.git", accountAlias: nil)]),
+        ])
         try store.save(state)
         #expect(try store.load() == state)
     }
 }
 
-private actor LineRecorder {
+actor LineRecorder {
     private(set) var all: [String] = []
     func append(_ line: String) { all.append(line) }
 }
